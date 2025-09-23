@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.venv*/
+env/
+env*/
+*.log
+
+# Environnements & clés
+.env
+.env.*
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App data (logs, outputs)
+data/*.csv
+data/*.json
+resume.txt   # résumé exporté (optionnel)
+
+# IDE / éditeurs
+.vscode/
+.idea/
