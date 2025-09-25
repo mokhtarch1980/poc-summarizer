@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 POC Résumeur de documents — version robuste UTF-8 (Windows-safe)
+Branche: feature/local-transformers
+- Tente OpenAI d'abord (si activé)
+- Fallback automatique sur Transformers local (mT5 multilingue) si pas de clé / quota / erreur
+- Baseline locale par fréquence toujours dispo
 """
 
 import io
@@ -18,7 +22,7 @@ import httpx
 from pathlib import Path
 from typing import List
 
-# ==== Forcer UTF-8 tôt (important sur Windows/Consoles) =======================
+# ==== Forcer UTF-8 tôt (Windows/Consoles) ====================================
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONUTF8", "1")
 try:
@@ -36,12 +40,28 @@ import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from dotenv import load_dotenv
-from openai import OpenAI  
+# (on n'utilise pas le SDK OpenAI ici; on passe par httpx)
 
-# ==== Chargement .env (clé OpenAI, modèle) ====================================
+# ==== Hugging Face (Transformers) ============================================
+_TRANS_AVAILABLE = True
+try:
+    from transformers import pipeline
+    import torch
+    # brider un peu le nombre de threads pour éviter de saturer la machine
+    if hasattr(torch, "set_num_threads"):
+        try:
+            torch.set_num_threads(min(4, os.cpu_count() or 2))
+        except Exception:
+            pass
+except Exception:
+    _TRANS_AVAILABLE = False
+    pipeline = None
+    torch = None
+
+# ==== .env (clé OpenAI, modèle) ==============================================
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ============================ Constantes ======================================
 MAX_FILE_SIZE_MB = 10
@@ -50,7 +70,6 @@ MIN_CHARS_FOR_SUMMARY = 80
 
 # ============================ Utilitaires UTF-8 ===============================
 def to_safe_utf8_text(x: object) -> str:
-    """pour convertir n'importe quoi en str UTF-8 safe (NFC)."""
     s = str(x)
     return unicodedata.normalize("NFC", s)
 
@@ -63,7 +82,7 @@ def _sleep_backoff(attempt: int):
 
 # ============================ Diagnostic & Réseau =============================
 def show_exception_panel(e: Exception):
-    """Panneau de diagnostic: type, message, traceback et éventuelle réponse HTTP."""
+    """Panneau de diagnostic (type, message, traceback, réponse HTTP si dispo)."""
     etype = type(e).__name__
     st.error(f"Type d'erreur : **{etype}**")
     st.write("**Message (str)**:", str(e))
@@ -142,7 +161,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-# ============================ Résumeur local ==================================
+# ============================ Résumeur local (baseline) =======================
 STOPWORDS = set("""
 a au aux avec ce ces dans de des du elle en et eux il je la le les leur lui ma mais me
 meme mes moi mon ne nos notre nous on ou par pas pour qu que qui sa se ses son sur ta te
@@ -180,7 +199,80 @@ def summarize_by_frequency(text: str, n_sentences: int = 5) -> str:
     ordered = [s for s in sentences if s in keep]
     return " ".join(ordered)
 
-# ============================ Résumé via OpenAI (HTTPX UTF-8) =================
+# ============================ Transformers local ==============================
+_SUMMARY_PIPELINE = None
+
+# modèle multilingue conseillé pour FR + fallback anglais
+DEFAULT_HF_MODEL  = "csebuetnlp/mT5_multilingual_xlsum"   # (~1.1–1.2GB)
+FALLBACK_HF_MODEL = "sshleifer/distilbart-cnn-12-6"       # secours si mT5 échoue
+
+def get_local_summarizer(model_name: str = DEFAULT_HF_MODEL):
+    """
+    Charge une seule fois le pipeline de résumé (CPU si pas de GPU).
+    """
+    if not _TRANS_AVAILABLE:
+        raise RuntimeError(
+            "Transformers/torch introuvables. Installe: "
+            "pip install transformers torch sentencepiece"
+        )
+    global _SUMMARY_PIPELINE
+    if _SUMMARY_PIPELINE is None:
+        device = 0 if (hasattr(torch, "cuda") and torch.cuda.is_available()) else -1
+        try:
+            _SUMMARY_PIPELINE = pipeline("summarization", model=model_name, device=device)
+        except Exception:
+            # ex: SSL, proxy, modèle indispo → on tente un modèle de secours
+            _SUMMARY_PIPELINE = pipeline("summarization", model=FALLBACK_HF_MODEL, device=device)
+    return _SUMMARY_PIPELINE
+
+def _chunk_text(text: str, chunk_chars: int = 2500) -> List[str]:
+    """
+    Découpe le texte en morceaux ~chunk_chars pour éviter les erreurs
+    de longueur max côté modèles (approx par caractères).
+    """
+    text = text.strip()
+    if len(text) <= chunk_chars:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_chars)
+        cut = text.rfind(".", start, end)
+        if cut == -1 or cut <= start + chunk_chars * 0.6:
+            cut = end
+        chunks.append(text[start:cut].strip())
+        start = cut
+    return [c for c in chunks if c]
+
+def summarize_local_transformers(
+    text: str,
+    model_name: str = DEFAULT_HF_MODEL,
+    max_length: int = 140,
+    min_length: int = 40,
+) -> str:
+    """
+    Résumé local via Transformers + chunking simple (map-reduce).
+    """
+    if not text or len(text.strip()) == 0:
+        return ""
+    summarizer = get_local_summarizer(model_name=model_name)
+
+    # 1) résumer par morceaux
+    chunks = _chunk_text(text, chunk_chars=2500)
+    partials = []
+    for c in chunks:
+        out = summarizer(c, max_length=max_length, min_length=min_length, truncation=True)
+        partials.append(out[0]["summary_text"].strip())
+
+    if len(partials) == 1:
+        return partials[0]
+
+    # 2) résumer l'assemblage des résumés (mini "reduce")
+    joined = " ".join(partials)
+    out2 = summarizer(joined, max_length=max_length, min_length=min_length, truncation=True)
+    return out2[0]["summary_text"].strip()
+
+# ============================ OpenAI via HTTPX (fallback-aware) ===============
 def summarize_with_llm(text: str, length: str = "court", language: str = "fr", verify=True) -> str:
     """
     - Appel OpenAI via HTTPX (UTF-8 ensure_ascii=False)
@@ -189,7 +281,7 @@ def summarize_with_llm(text: str, length: str = "court", language: str = "fr", v
     - message clair si insufficient_quota
     """
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY manquante (je l'ajoute dans un fichier .env).")
+        raise RuntimeError("OPENAI_API_KEY manquante (ajoute-la dans un fichier .env).")
 
     body_text = to_safe_utf8_text(text[:MAX_CHARS])
     prompt = f"""
@@ -268,7 +360,8 @@ def _ngrams(tokens, n):
     return list(zip(*[tokens[i:] for i in range(n)]))
 
 def rouge_n(ref: str, hyp: str, n: int = 1):
-    """ROUGE-N (recall): chevauchement d'ngrams côté référence."""
+    """ROUGE-N (recall)"""
+    from collections import Counter
     r_toks, h_toks = _tokens(ref), _tokens(hyp)
     if not r_toks or not h_toks:
         return 0.0
@@ -276,13 +369,12 @@ def rouge_n(ref: str, hyp: str, n: int = 1):
     h_ngrams = _ngrams(h_toks, n)
     if not r_ngrams or not h_ngrams:
         return 0.0
-    from collections import Counter
     r_c, h_c = Counter(r_ngrams), Counter(h_ngrams)
     overlap = sum((r_c & h_c).values())
     return overlap / max(1, len(r_ngrams))
 
 def lcs_len(a, b):
-    """Longest Common Subsequence length (O(n*m) simple)."""
+    """Longest Common Subsequence length."""
     A, B = _tokens(a), _tokens(b)
     n, m = len(A), len(B)
     if n == 0 or m == 0:
@@ -306,7 +398,7 @@ def rouge_l(ref: str, hyp: str):
     return lcs_len(ref, hyp) / len(r)
 
 def tfidf_cosine(a: str, b: str):
-    """Cosine TF-IDF simple (sans scikit-learn)."""
+    """Cosine TF-IDF simple (2 docs)."""
     ta, tb = _tokens(a), _tokens(b)
     vocab = {}
     for t in set(ta + tb):
@@ -317,7 +409,6 @@ def tfidf_cosine(a: str, b: str):
         c = Counter(tokens)
         return {t: c[t] / len(tokens) for t in c}
     tfa, tfb = tf(ta), tf(tb)
-    # idf binaire sur 2 docs
     df = {}
     for t in set(ta): df[t] = df.get(t, 0) + 1
     for t in set(tb): df[t] = df.get(t, 0) + 1
@@ -331,8 +422,8 @@ def tfidf_cosine(a: str, b: str):
         return v
     va, vb = vec(tfa), vec(tfb)
     dot = sum(x*y for x, y in zip(va, vb))
-    na = math.sqrt(sum(x*x for x in va))
-    nb = math.sqrt(sum(x*x for x in vb))
+    na = sum(x*x for x in va) ** 0.5
+    nb = sum(x*x for x in vb) ** 0.5
     return (dot / (na * nb)) if na > 0 and nb > 0 else 0.0
 
 def compression_ratio(src: str, summ: str):
@@ -342,14 +433,14 @@ def reading_time_minutes(words: int, wpm: int = 220):
     import math
     return round(words / max(1, wpm), 2)
 
-# ============================ UI Streamlit (sans emojis) ======================
+# ============================ UI Streamlit ====================================
 st.set_page_config(page_title="POC – Résumé de documents", layout="centered")
 
 st.title("POC — Résumé automatique")
 st.write(
     "Charge un **TXT**, **PDF** ou **DOCX** et génère un **résumé**.\n\n"
     "- Mode **local** (baseline) sans IA\n"
-    "- Mode **IA** (OpenAI) pour une meilleure qualité\n"
+    "- Mode **IA** (OpenAI) avec fallback **Transformers local** multilingue\n"
     "- Onglet **Évaluation** pour comparer à un résumé humain"
 )
 
@@ -364,10 +455,21 @@ with col_a:
 with col_b:
     insecure_ssl = st.checkbox("Ignorer la vérif SSL (non recommandé)", value=False)
 
-# verify à propager aux appels HTTPX
 verify_target = False if insecure_ssl else (ca_bundle_path or True)
 
-# ---- Panneau de diagnostic OpenAI
+# >>>>>> Rendre Transformers/HF sensibles au certificat/SSL <<<<<<
+# Si un bundle CA est fourni, force Requests/HF à l'utiliser
+if ca_bundle_path:
+    os.environ["SSL_CERT_FILE"] = ca_bundle_path
+    os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle_path
+    os.environ["CURL_CA_BUNDLE"] = ca_bundle_path  # utile pour certains backends
+
+# Option test (⚠️ à éviter en prod) : ignorer la vérif SSL pour Hugging Face
+if insecure_ssl:
+    # C'est cette variable qui est prise en compte par huggingface_hub
+    os.environ["HF_HUB_DISABLE_SSL_VERIFY"] = "1"
+
+# ---- Diagnostic OpenAI
 with st.expander("Diagnostic OpenAI (optionnel)"):
     st.caption("Appel simple /v1/models pour vérifier la clé, le réseau et le proxy.")
     if st.button("Tester la connexion OpenAI"):
@@ -388,12 +490,15 @@ with tab_generate:
     summary_length = st.slider("Longueur du résumé (nb de phrases pour le mode local)", 3, 10, 5)
 
     # Contrôles IA
-    use_llm = st.toggle("Activer l'IA (OpenAI)", value=False, help="Nécessite OPENAI_API_KEY dans .env")
+    use_llm = st.toggle(
+        "Activer l'IA (OpenAI) avec fallback Transformers local",
+        value=False,
+        help="Si la clé/quotas OpenAI ne sont pas dispo, on bascule automatiquement sur un modèle local (mT5 multilingue)."
+    )
     length_choice = st.select_slider("Style de résumé (IA)", options=["court", "moyen", "long"], value="court")
     lang_choice = st.selectbox("Langue du résumé", options=["fr", "en"], index=0)
 
     if uploaded is not None:
-        # Taille du fichier
         if getattr(uploaded, "size", 0) > MAX_FILE_SIZE_MB * 1024 * 1024:
             st.error(f"Fichier trop gros (> {MAX_FILE_SIZE_MB} Mo).")
             st.stop()
@@ -401,7 +506,6 @@ with tab_generate:
         raw = uploaded.read()
         ext = uploaded.name.lower().split(".")[-1]
 
-        # Extraction avec gestion d'erreur
         try:
             if ext == "txt":
                 text = extract_text_from_txt(raw)
@@ -418,7 +522,6 @@ with tab_generate:
 
         text = clean_text(text)
 
-        # Cas vide / trop court
         if not text:
             if ext == "pdf":
                 st.warning("Aucun texte détecté. Ce PDF est peut-être scanné (OCR non supporté pour l’instant).")
@@ -431,7 +534,6 @@ with tab_generate:
             st.write(text)
             st.stop()
 
-        # Tronquage
         if len(text) > MAX_CHARS:
             st.warning(f"Document tronqué à {MAX_CHARS} caractères pour le traitement.")
             text = text[:MAX_CHARS]
@@ -444,15 +546,38 @@ with tab_generate:
             with st.spinner("Génération du résumé..."):
                 try:
                     if use_llm:
-                        summary = summarize_with_llm(
-                            text, length=length_choice, language=lang_choice, verify=verify_target
-                        )
-                        method = "LLM"
-                        length_label = length_choice
+                        try:
+                            # 1) Essayer OpenAI
+                            summary = summarize_with_llm(
+                                text, length=length_choice, language=lang_choice, verify=verify_target
+                            )
+                            method = "LLM (OpenAI)"
+                            length_label = length_choice
+                        except Exception:
+                            # 2) Fallback Transformers local
+                            st.info("Basculage sur **Transformers local** (pas de clé/quota OpenAI ou erreur).")
+                            try:
+                                summary = summarize_local_transformers(text)
+                                method = "LLM local (mT5/DistilBART)"
+                                length_label = "auto"
+                            except Exception as e_loc:
+                                # 3) Fallback baseline si transformers non dispo/erreur
+                                if not _TRANS_AVAILABLE:
+                                    st.warning("Transformers/torch indisponibles. Fallback sur baseline locale.")
+                                elif "CERTIFICATE_VERIFY_FAILED" in str(e_loc):
+                                    st.warning("⚠️ Téléchargement Hugging Face bloqué par le SSL/proxy. "
+                                               "Le mode local avancé n’a pas pu démarrer. Baseline activée.")
+                                else:
+                                    st.warning(f"Erreur Transformers. Fallback sur baseline locale. Détails: {e_loc}")
+                                n = summary_length
+                                summary = summarize_by_frequency(text, n_sentences=n)
+                                method = "local baseline"
+                                length_label = f"{n} phrases"
                     else:
+                        # Baseline locale
                         n = summary_length
                         summary = summarize_by_frequency(text, n_sentences=n)
-                        method = "local"
+                        method = "local baseline"
                         length_label = f"{n} phrases"
 
                     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -460,17 +585,13 @@ with tab_generate:
                     if summary:
                         st.subheader("Résumé")
                         st.text_area("Texte du résumé", value=to_safe_utf8_text(summary), height=220)
-
-                        # Mémoriser pour l'onglet Évaluation
                         st.session_state["last_summary"] = summary
 
-                        # Log protégé (jamais bloquant)
                         try:
                             log_usage(uploaded.name, method, length_label, lang_choice, len(text), duration_ms)
                         except Exception as log_err:
                             st.warning(f"Log non enregistré: {to_safe_utf8_text(log_err)}")
 
-                        # Téléchargement
                         try:
                             st.download_button(
                                 label="Télécharger le résumé (.txt)",
@@ -484,25 +605,8 @@ with tab_generate:
                         st.info("Résumé vide : texte trop court ou non pertinent.")
 
                 except Exception as e:
-                    msg = str(e)
-                    # Fallback auto lorsque le quota épuisé
-                    if "Quota insuffisant" in msg or "insufficient_quota" in msg:
-                        st.warning("Plus de crédits/quota côté OpenAI. Passage en mode **local** (sans IA).")
-                        n = summary_length
-                        summary = summarize_by_frequency(text, n_sentences=n)
-                        method = "local"
-                        length_label = f"{n} phrases"
-                        duration_ms = int((time.perf_counter() - t0) * 1000)
-                        st.subheader("Résumé (fallback local)")
-                        st.text_area("Texte du résumé", value=to_safe_utf8_text(summary), height=220)
-                        st.session_state["last_summary"] = summary
-                        try:
-                            log_usage(uploaded.name, method, length_label, lang_choice, len(text), duration_ms)
-                        except Exception:
-                            pass
-                    else:
-                        st.error("Une erreur est survenue pendant le résumé (voir détails ci-dessous).")
-                        show_exception_panel(e)
+                    st.error("Une erreur est survenue pendant le résumé (voir détails).")
+                    show_exception_panel(e)
 
 # --------------------------- Onglet Évaluation --------------------------------
 with tab_eval:
@@ -524,9 +628,9 @@ with tab_eval:
         if not ref_text or not hyp_text:
             st.warning("Il faut un résumé **référence** et un **résumé à évaluer**.")
         else:
-            r1 = rouge_n(ref_text, hyp_text, 1)
-            r2 = rouge_n(ref_text, hyp_text, 2)
-            rl = rouge_l(ref_text, hyp_text)
+            r1  = rouge_n(ref_text, hyp_text, 1)
+            r2  = rouge_n(ref_text, hyp_text, 2)
+            rl  = rouge_l(ref_text, hyp_text)
             cos = tfidf_cosine(ref_text, hyp_text)
             comp = compression_ratio(src_text or ref_text, hyp_text)
 
@@ -534,7 +638,7 @@ with tab_eval:
             hyp_w = len(_tokens(hyp_text))
             t_src = reading_time_minutes(src_w)
             t_hyp = reading_time_minutes(hyp_w)
-            gain = round(max(0, t_src - t_hyp), 2)
+            gain  = round(max(0, t_src - t_hyp), 2)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("ROUGE-1 (recall)", f"{r1:.2f}")
@@ -551,7 +655,44 @@ with tab_eval:
             })
 
 # ============================ Historique & métriques ==========================
+
+def wipe_history_all():
+    try:
+        LOG_PATH.unlink(missing_ok=True)
+        return True, "Historique supprimé."
+    except Exception as e:
+        return False, str(e)
+
+def wipe_history_last_n(n: int = 5):
+    try:
+        if not LOG_PATH.exists():
+            return True, "Aucun historique à purger."
+        lines = LOG_PATH.read_text(encoding="utf-8-sig").splitlines()
+        if not lines:
+            return True, "Aucun historique à purger."
+        header, data = lines[0], lines[1:]
+        if not data:
+            return True, "Aucun historique à purger."
+        keep = data[:-n] if len(data) > n else []
+        out = [header] + keep
+        LOG_PATH.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8-sig")
+        return True, f"Dernières {min(n, len(data))} entrées supprimées."
+    except Exception as e:
+        return False, str(e)
+
 st.markdown("## Historique et métriques")
+
+c1, c2 = st.columns(2)
+if c1.button("🧹 Supprimer tout l'historique"):
+    ok, msg = wipe_history_all()
+    (st.success if ok else st.error)(msg)
+    st.rerun()
+
+if c2.button("🗑️ Supprimer les 5 dernières entrées"):
+    ok, msg = wipe_history_last_n(5)
+    (st.success if ok else st.error)(msg)
+    st.rerun()
+
 total_docs = 0
 avg_duration = 0
 ratio_llm = 0.0
@@ -578,7 +719,7 @@ if LOG_PATH.exists():
                         durations.append(int(dur))
                     except Exception:
                         pass
-                    if method == "LLM":
+                    if str(method).startswith("LLM"):
                         llm_count += 1
                     table_rows.append({
                         "Date/heure": ts,
@@ -586,8 +727,8 @@ if LOG_PATH.exists():
                         "Méthode": method,
                         "Longueur": length_lbl,
                         "Langue": lang_lbl,
-                        "Caractères": int(chars) if chars.isdigit() else chars,
-                        "Durée (ms)": int(dur) if dur.isdigit() else dur,
+                        "Caractères": int(chars) if str(chars).isdigit() else chars,
+                        "Durée (ms)": int(dur) if str(dur).isdigit() else dur,
                     })
             avg_duration = int(sum(durations) / len(durations)) if durations else 0
             ratio_llm = (llm_count / len(data)) * 100 if data else 0.0
@@ -607,4 +748,4 @@ else:
     st.info("Aucun historique pour le moment. Générez un premier résumé.")
 
 st.markdown("---")
-st.caption("POC : baseline locale + option IA via OpenAI. Étapes suivantes : OCR, multilingue avancé, métriques.")
+st.caption("POC : baseline locale + fallback IA via Transformers (mT5/DistilBART); option OpenAI si clé/quotas disponibles.")
